@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 import contextlib
+from unittest.mock import Mock
 
 import torch
 from torch._inductor.codegen.cpp_utils import CppCSEVariable
@@ -12,6 +13,8 @@ from torch._inductor.ir import (
     Pointwise,
     ShapeAsConstantBuffer,
 )
+from torch._inductor.loop_body import _MaskStoresHandler, LoopBody
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.virtualized import ops, V
@@ -121,6 +124,101 @@ class TestDependencies(InductorTestCase):
 
         reads = {dep.name for dep in extern.get_read_writes().reads}
         self.assertEqual(reads, {"data", "index", "value"})
+
+    def test_masked_store_records_full_write(self):
+        """
+        A masked store is deliberately recorded as a full write over the
+        expanded domain. That over-approximation is what keeps WAW/WAR ordering
+        edges intact; the resulting imprecision is handled by refusing in-place
+        reuse (see SchedulerNode.can_inplace).
+        """
+        from torch._inductor.dependencies import extract_read_writes
+
+        def fn(index):
+            (x,) = index
+            mask = ops.lt(ops.index_expr(x, torch.int32), ops.constant(48, torch.int32))
+            ops.masked_store("out", x, ops.constant(1.0, torch.float32), mask)
+
+        rw = extract_read_writes(fn, [64])
+        writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0].name, "out")
+        # Recorded over the whole 64-element range even though the mask may
+        # exclude a tail, and with no store mode (no atomic masked store).
+        self.assertEqual(writes[0].get_numel(), 64)
+        self.assertEqual(writes[0].mode, None)
+
+    def test_masked_expansion_rewrites_stores_and_keeps_raw_loads(self):
+        from torch._inductor.loop_body import MASKED_EXPANSION_BANNED_OPS
+        from torch.utils._sympy.functions import ModularIndexing
+
+        x = sympy_index_symbol("x")
+
+        def fn(index, rindex):
+            (i,) = index
+            edge = ops.lt(ops.index_expr(i, torch.int64), ops.constant(2, torch.int64))
+            other = ops.masked(edge, lambda: ops.load("other", i), 0.0)
+            ops.store("out", i, ops.add(ops.load("inp", i), other))
+
+        body = LoopBody(fn, ([x], []), {x: 4}, [x], [])
+        expanded = body.expand_dimension_for_pointwise_node_with_masked_stores(0, 6)
+
+        self.assertEqual(expanded.sizes, ((6,), ()))
+        self.assertTrue(expanded.has_op("masked_store"))
+        self.assertFalse(expanded.has_op("store"))
+        self.assertFalse(
+            any(e.has(ModularIndexing) for e in expanded.indexing_exprs.values())
+        )
+        # The tail predicate is combined into the nested mask.
+        masked_calls = expanded.root_block.graph.find_nodes(op="call_module")
+        self.assertTrue(
+            any(str(n.target).startswith("masked_subblock") for n in masked_calls)
+        )
+        self.assertEqual(
+            len(
+                expanded.root_block.graph.find_nodes(
+                    op="call_method", target="logical_and"
+                )
+            ),
+            1,
+        )
+        # Expanding to the current range is a no-op.
+        self.assertIs(
+            body.expand_dimension_for_pointwise_node_with_masked_stores(0, 4), body
+        )
+        # Bodies with banned ops are rejected before any mutation.
+        self.assertIn("indirect_indexing", MASKED_EXPANSION_BANNED_OPS)
+
+        def indirect(index, rindex):
+            (i,) = index
+            j = ops.indirect_indexing(ops.load("idx", i), 4)
+            ops.store("out", i, ops.load("inp", j))
+
+        bad = LoopBody(indirect, ([x], []), {x: 4}, [x], [])
+        with self.assertRaisesRegex(AssertionError, "indirect_indexing"):
+            bad.expand_dimension_for_pointwise_node_with_masked_stores(0, 6)
+        with self.assertRaisesRegex(AssertionError, "masked_store"):
+            expanded.expand_dimension_for_pointwise_node_with_masked_stores(0, 8)
+
+    def test_masked_store_disables_inplace_reuse(self):
+        body = object.__new__(LoopBody)
+        body.op_counts = {"masked_store": 1}
+        node = object.__new__(SchedulerNode)
+        node._body = body
+        node.node = None
+        node.outputs = []
+
+        self.assertFalse(node.can_inplace(object()))
+
+    def test_masked_expansion_combines_nested_mask(self):
+        inner = Mock()
+        inner.logical_and.return_value = "combined"
+        body = Mock()
+
+        _MaskStoresHandler(inner, "outer").masked("inner", body, "other")
+
+        inner.logical_and.assert_called_once_with("outer", "inner")
+        inner.masked.assert_called_once_with("combined", body, "other")
 
     def test_get_offset(self):
         x = sympy_index_symbol("x")
