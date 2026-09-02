@@ -346,8 +346,12 @@ class LoopBody:
         expand_dimension_for_pointwise_node, this does not wrap the expanded
         dimension in `Mod`, so loads, index_exprs and bounds checks all evaluate
         at the raw expanded coordinate; only the writes are masked. The caller
-        must prove the added tail addresses are live and reject bodies containing
-        MASKED_EXPANSION_BANNED_OPS.
+        must prove the added tail addresses are live. Loads inside `ops.masked`
+        subblocks are safe because _MaskStoresHandler conjoins the tail
+        predicate into their mask; only root-block loads run unmasked in the
+        tail (see `Scheduler._try_masked_reindex_reduction_consumer`, which
+        requires each of them to match a write of the reduction). Bodies
+        containing MASKED_EXPANSION_BANNED_OPS are rejected here.
         """
         illegal = [
             op
